@@ -146,7 +146,7 @@ def c00_kcorr(obs_flux, obs_wavelength, bdec, Rv=4.05):
     return int_flux
 
 
-def sfr_ha_map(halphadc_map, z):
+def sfr_ha_map(halphadc_map, z, bin_area_map):
     """
     Paremters:
         halphadc_map
@@ -161,7 +161,9 @@ def sfr_ha_map(halphadc_map, z):
     # print('Lum Distance {} converted to {} cm'.format(lum_d_mpc, lum_d_cm))
 
     # Convert flux to Luminosity
-    lum_ha_map = halphadc_map * (4 * np.pi * (lum_d_cm ** 2))  # 1e-17 erg / (s spaxel)
+    # Halpha Flux : 1e-17*erg/s/cm^2/spaxel
+    # From Hoggs 2000 paper
+    lum_ha_map = halphadc_map * (1 + z) * (4 * np.pi * (lum_d_cm ** 2))
     # print('Halpha Flux: ',halphadc_map[27,27])
     # print('Halpha Luminosity: ',l_ha[27,27])
 
@@ -169,14 +171,27 @@ def sfr_ha_map(halphadc_map, z):
     sfr_map = 8.79e-42 * lum_ha_map  # [Msolar/yr]
     # print('SFR: ',sfr_map[27,27])
 
-    spaxel_size = 0.5  # [arcsec]
-    c = 299792  # speed of light [km/s]
-    H0 = 70  # [km s^-1 Mpc^-1]
-    D = c * z / H0  # approx. distance to galaxy [Mpc]
+    # Estimate the spaxel diameter in kpc
+    spaxel_diamter_in_kpc = cosmo.kpc_proper_per_arcmin(z).to(
+        u.kpc / u.arcsec
+    )  # [kpc/arcsec]
+    spaxel_area_in_kpc2 = (
+        spaxel_diamter_in_kpc ** 2
+    )  # [kpc2/arcsec2] Since my data is binned the area is a roughly a box for each pixel
 
-    scale = 1 / 206265 * D * 1e6  # 1 radian = 206265 arcsec [pc / arcsec]
-    spaxel_area_pc2 = (scale * spaxel_size) ** 2 * u.pc ** 2  # [pc^2]
-    spaxel_area_kpc2 = spaxel_area_pc2.to(u.kpc ** 2)
+    # Using the Bin Area to calculate the Area of each bin in Kpc
+    spaxel_area_kpc2 = spaxel_area_in_kpc2 * bin_area_map
+    # Bin length from the Bin Area Map - np.sqrt(BIN_AREA[arcsec^2])
+    # bin_length = np.sqrt(bin_area_map) # [arcsec]
+
+    # spaxel_size = 0.5  # [arcsec]
+    # c = 299792  # speed of light [km/s]
+    # H0 = 70  # [km s^-1 Mpc^-1]
+    # D = c * z / H0  # approx. distance to galaxy [Mpc]
+
+    # scale = 1 / 206265 * D * 1e6  # 1 radian = 206265 arcsec [pc / arcsec]
+    # spaxel_area_pc2 = (scale * spaxel_size) ** 2 * u.pc ** 2  # [pc^2]
+    # spaxel_area_kpc2 = spaxel_area_pc2.to(u.kpc ** 2)
 
     # Calculate the SFRD of each spaxel
     sfrd_map_kpc2 = sfr_map / spaxel_area_kpc2.value  # [Msolar/yr/kpc2]
@@ -193,7 +208,13 @@ def sfr_ha_map(halphadc_map, z):
     # sfrd_map = sfr_map / Area_of_each_spaxels
     ##print('SFRD: ',sfrd_map[27,27])
 
-    return sfr_map, lum_ha_map, sfrd_map_kpc2, spaxel_area_kpc2.value
+    return (
+        sfr_map,
+        lum_ha_map,
+        sfrd_map_kpc2,
+        spaxel_area_kpc2.value,
+        spaxel_diamter_in_kpc.value,
+    )
 
 
 # def radius_ratio_map(plateifu):
@@ -272,9 +293,9 @@ def pipe3d_maps(plateifu, sample="bbrd"):
     age_l = hdu[1].data[5, :, :]  # Gyr - Luminosity Weighted age
     age_m = hdu[1].data[6, :, :]  # Gyr - Mass Weighted age
     age_err = hdu[1].data[7, :, :]  # Gyr - Error of the age
-    metal_l = hdu[1].data[
-        8, :, :
-    ]  # Luminosity Weighted metallicity of the stellar population (where Z=0.02 is solar metallicity)
+    # Luminosity Weighted metallicity of the stellar population (where Z=0.02 is solar metallicity)
+    metal_l = hdu[1].data[8, :, :]
+
     metal_m = hdu[1].data[
         9, :, :
     ]  # Mass Weighted metallicity of the stellar population
@@ -295,9 +316,10 @@ def pipe3d_maps(plateifu, sample="bbrd"):
     mass_rho = hdu[1].data[
         19, :, :
     ]  # [Log(Msun/spaxels^2)] Stellar Mass density per pixel with dust correction
-    mass_rho = hdu[1].data[
-        19, :, :
+    mass_rho_err = hdu[1].data[
+        20, :, :
     ]  # [Log(Msun/spaxels^2)] Stellar Mass density per pixel with dust correction
+
 
     # INDCICES - not corrected for velocity dispersion
     d4000_index = hdu[4].data[5, :, :]  # D4000 index map
@@ -320,6 +342,7 @@ def pipe3d_maps(plateifu, sample="bbrd"):
         v_err,
         ml_ratio,
         mass_rho,
+        mass_rho_err,
         d4000_index,
         d4000_err,
         hdelta_index,
@@ -327,40 +350,112 @@ def pipe3d_maps(plateifu, sample="bbrd"):
     )
 
 
-# SDSS Global BPT Classification
-def bpt_ifu_classification(o3_5008_mapdc, hb_mapdc, nii6585_mapdc, ha_mapdc):
-    # Classify spaxel using BPT from Kewley et al 2006?
-    #
-    # Compute BPT ratios
-    # OIII/Hbeta, NII/halpha extinction corrected
-    o3hb_ratio = np.log10(o3_5008_mapdc / hb_mapdc)
-    n2ha_ratio = np.log10(nii6585_mapdc / ha_mapdc)
+# Resolved BPT Classification
+# def bpt_ifu_classification(o3_5008_mapdc, hb_mapdc, nii6585_mapdc, ha_mapdc):
+#     # Classify spaxel using BPT from Kewley et al 2006?
+#     #
+#     # Compute BPT ratios
+#     # OIII/Hbeta, NII/halpha extinction corrected
+#     o3hb_ratio_orig = np.log10(o3_5008_mapdc / hb_mapdc)
+#     n2ha_ratio_orig = np.log10(nii6585_mapdc / ha_mapdc)
 
-    ## OIII/Hbeta, NII/halpha non-extinction corrected
-    # o3hb_ratio_ne = np.log10(o3_5008_val / hb_val)
-    # n2ha_ratio_ne = np.log10(nii6585_val / ha_val)
+#     o3hb_ratio = np.copy(o3hb_ratio_orig)
+#     n2ha_ratio = np.copy(n2ha_ratio_orig)
 
-    # Classify spaxels
-    agn_mask = (o3hb_ratio > (0.61 / (n2ha_ratio - 0.47)) + 1.19) | (
-        n2ha_ratio > 0.4
-    )  # AGN class
-    comp_mask = (o3hb_ratio <= (0.61 / (n2ha_ratio - 0.47)) + 1.19) & (
-        o3hb_ratio >= (0.61 / (n2ha_ratio - 0.05)) + 1.3
-    )  # Composite class
-    sf_mask = (
-        (o3hb_ratio <= (0.61 / (n2ha_ratio - 0.05)) + 1.3)
-        & (o3hb_ratio <= (0.61 / (n2ha_ratio - 0.47)) + 1.19)
-        & (n2ha_ratio <= 0.4)
-    )  # SF class
+#     ## OIII/Hbeta, NII/halpha non-extinction corrected
+#     # o3hb_ratio_ne = np.log10(o3_5008_val / hb_val)
+#     # n2ha_ratio_ne = np.log10(nii6585_val / ha_val)
 
-    # Combine mask to create BPT image
-    # Where 1:SF, 2:Comp, 3:AGN
-    sf_mask_num = np.where(sf_mask == True, 1, sf_mask)
-    comp_mask_num = np.where(comp_mask == True, 2, comp_mask)
-    agn_mask_num = np.where(agn_mask == True, 3, agn_mask)
-    combo_mask_num = agn_mask_num + sf_mask_num + comp_mask_num
+#     # Classify spaxels
+#     agn_mask = (o3hb_ratio > (0.61 / (n2ha_ratio - 0.47)) + 1.19) | (
+#         n2ha_ratio > 0.4
+#     )  # AGN class
+#     comp_mask = (o3hb_ratio <= (0.61 / (n2ha_ratio - 0.47)) + 1.19) & (
+#         o3hb_ratio >= (0.61 / (n2ha_ratio - 0.05)) + 1.3
+#     )  # Composite class
+#     sf_mask = (
+#         (o3hb_ratio <= (0.61 / (n2ha_ratio - 0.05)) + 1.3)
+#         & (o3hb_ratio <= (0.61 / (n2ha_ratio - 0.47)) + 1.19)
+#         & (n2ha_ratio <= 0.4)
+#     )  # SF class
 
-    return o3hb_ratio, n2ha_ratio, combo_mask_num
+#     # Combine mask to create BPT image
+#     # Where 1:SF, 2:Comp, 3:AGN
+#     sf_mask_num = np.where(sf_mask == True, 1, sf_mask)
+#     comp_mask_num = np.where(comp_mask == True, 2, comp_mask)
+#     agn_mask_num = np.where(agn_mask == True, 3, agn_mask)
+#     combo_mask_num = agn_mask_num + sf_mask_num + comp_mask_num
+
+#     return o3hb_ratio_orig, n2ha_ratio_orig, combo_mask_num
+
+
+def bpt_o3hb_n2ha_diagnostic_polyfit(
+    n2ha_sf_range=np.linspace(-2.0, 0, 200), n2ha_comp_range=np.linspace(-2.0, 0.4, 200)
+):
+    ka03_o3ha_sf_fit = (0.61 / (n2ha_sf_range - 0.05)) + 1.3
+    ke06_o3ha_comp_fit = (0.61 / (n2ha_comp_range - 0.47)) + 1.19
+    return ka03_o3ha_sf_fit, ke06_o3ha_comp_fit
+
+
+def bpt_n2ha_2dmap(o3_5008_fluxmap, hb_fluxmap, nii6585_fluxmap, ha_fluxmap):
+
+    # Compute Ratios
+    o3hb_ratio_map_orig = o3_5008_fluxmap / hb_fluxmap
+    n2ha_ratio_map_orig = nii6585_fluxmap / ha_fluxmap
+
+    # Make copy of ratio maps
+    o3hb_ratio_map = np.log10(np.copy(o3hb_ratio_map_orig))
+    n2ha_ratio_map = np.log10(np.copy(n2ha_ratio_map_orig))
+
+    # Calculate the estimated value for OIII/Hbeta map from NII/Halpha
+    ka03_o3ha_sf_fit, ke06_o3ha_comp_fit = bpt_o3hb_n2ha_diagnostic_polyfit(
+        n2ha_ratio_map, n2ha_ratio_map
+    )
+
+    # Select Log(OIII/Hbeta) values below the sf polyfit curve
+    o3ha_sf_spaxels = np.copy(o3hb_ratio_map)
+    o3ha_sf_spaxels[o3ha_sf_spaxels >= ka03_o3ha_sf_fit] = np.nan
+    o3ha_sf_spaxels[n2ha_ratio_map >= -0.1] = np.nan
+
+    # Select Log(OIII/Hbeta) values above the sf polyfit curve and below the composite curves
+    o3ha_comp_spaxels = np.copy(o3hb_ratio_map)
+    o3ha_comp_spaxels[
+        o3ha_comp_spaxels == o3ha_sf_spaxels
+    ] = np.nan  # set sf classifed spaxel to nan
+    o3ha_comp_spaxels[o3ha_comp_spaxels >= ke06_o3ha_comp_fit] = np.nan
+    o3ha_comp_spaxels[n2ha_ratio_map >= 0.25] = np.nan
+
+    # Select Log(OIII/Hbeta) values above the comp ployfit
+    o3ha_agn_spaxels = np.copy(o3hb_ratio_map)
+    o3ha_agn_spaxels[
+        o3ha_agn_spaxels == o3ha_sf_spaxels
+    ] = np.nan  # set sf classifed spaxel to nan
+    o3ha_agn_spaxels[
+        o3ha_agn_spaxels == o3ha_comp_spaxels
+    ] = np.nan  # set sf classifed spaxel to nan
+
+    # SF spaxel constant map value=1
+    sf_spax_constmap = np.copy(o3ha_sf_spaxels)
+    sf_spax_constmap[o3ha_sf_spaxels > -99.0] = 1.0
+
+    # Composite spaxel constant map value=2
+    comp_spax_constmap = np.copy(o3ha_comp_spaxels)
+    comp_spax_constmap[o3ha_comp_spaxels > -99.0] = 2.0
+
+    # Composite spaxel constant map value=2
+    agn_spax_constmap = np.copy(o3ha_agn_spaxels)
+    agn_spax_constmap[o3ha_agn_spaxels > -99.0] = 3.0
+
+    # BPT datacube
+    bpt_3d_constant_map = np.dstack(
+        (sf_spax_constmap, comp_spax_constmap, agn_spax_constmap)
+    )
+
+    # Resolved BPT 2D map
+    bpt_2d_constant_map = np.nansum(bpt_3d_constant_map, axis=2)
+    bpt_2d_constant_map[bpt_2d_constant_map == 0.0] = np.nan
+
+    return o3hb_ratio_map, n2ha_ratio_map, bpt_2d_constant_map
 
 
 def write_maps2fits_mpldap(plateifu="None", mode="local", sample="bbrd", z="False"):
@@ -376,26 +471,26 @@ def write_maps2fits_mpldap(plateifu="None", mode="local", sample="bbrd", z="Fals
 
     # Read in MaNGA Maps from local directory with MPL11 DAP files -
     # Emmison line units [1e-17 erg / (cm s spaxel)]
-    ha_6564_map = dap_gal_fits[30].data[24]
-    hb_4862_map = dap_gal_fits[30].data[15]
-    nii6585_map = dap_gal_fits[30].data[23]
-    oii3727_map = dap_gal_fits[30].data[1]
-    oii3729_map = dap_gal_fits[30].data[2]
-    o3_5008_map = dap_gal_fits[30].data[17]
-    sii6718_map = dap_gal_fits[30].data[26]
-    sii6732_map = dap_gal_fits[30].data[27]
+    ha_6564_map = dap_gal_fits[30].data[23]
+    hb_4862_map = dap_gal_fits[30].data[14]
+    nii6585_map = dap_gal_fits[30].data[24]
+    oii3727_map = dap_gal_fits[30].data[0]
+    oii3729_map = dap_gal_fits[30].data[1]
+    o3_5008_map = dap_gal_fits[30].data[16]
+    sii6718_map = dap_gal_fits[30].data[25]
+    sii6732_map = dap_gal_fits[30].data[26]
 
     # Data Quality Maps
-    ha_6564_dqmap = dap_gal_fits[32].data[24]
-    hb_4862_dqmap = dap_gal_fits[32].data[15]
-    nii6585_dqmap = dap_gal_fits[32].data[23]
-    oii3727_dqmap = dap_gal_fits[32].data[1]
-    oii3729_dqmap = dap_gal_fits[32].data[2]
-    o3_5008_dqmap = dap_gal_fits[32].data[17]
-    sii6718_dqmap = dap_gal_fits[32].data[26]
-    sii6732_dqmap = dap_gal_fits[32].data[27]
+    ha_6564_dqmap = dap_gal_fits[32].data[23]
+    hb_4862_dqmap = dap_gal_fits[32].data[14]
+    nii6585_dqmap = dap_gal_fits[32].data[24]
+    oii3727_dqmap = dap_gal_fits[32].data[0]
+    oii3729_dqmap = dap_gal_fits[32].data[1]
+    o3_5008_dqmap = dap_gal_fits[32].data[16]
+    sii6718_dqmap = dap_gal_fits[32].data[25]
+    sii6732_dqmap = dap_gal_fits[32].data[26]
 
-    # # Inverse Varience maps
+    # # Inverse Varience maps []
     # ha_6564_ivar_map = dap_gal_fits[31].data[24]
     # hb_4862_ivar_map = dap_gal_fits[31].data[15]
     # nii6585_ivar_map = dap_gal_fits[31].data[23]
@@ -406,14 +501,14 @@ def write_maps2fits_mpldap(plateifu="None", mode="local", sample="bbrd", z="Fals
     # sii6732_ivar_map = dap_gal_fits[31].data[27]
 
     # Convert Inverse Varience maps to error maps
-    ha_6564_error_map = np.sqrt(1 / (dap_gal_fits[31].data[24]))
-    hb_4862_error_map = np.sqrt(1 / (dap_gal_fits[31].data[15]))
-    nii6585_error_map = np.sqrt(1 / (dap_gal_fits[31].data[23]))
-    oii3727_error_map = np.sqrt(1 / (dap_gal_fits[31].data[1]))
-    oii3729_error_map = np.sqrt(1 / (dap_gal_fits[31].data[2]))
-    o3_5008_error_map = np.sqrt(1 / (dap_gal_fits[31].data[17]))
-    sii6718_error_map = np.sqrt(1 / (dap_gal_fits[31].data[26]))
-    sii6732_error_map = np.sqrt(1 / (dap_gal_fits[31].data[27]))
+    ha_6564_error_map = np.sqrt(1 / (dap_gal_fits[31].data[23]))
+    hb_4862_error_map = np.sqrt(1 / (dap_gal_fits[31].data[14]))
+    nii6585_error_map = np.sqrt(1 / (dap_gal_fits[31].data[24]))
+    oii3727_error_map = np.sqrt(1 / (dap_gal_fits[31].data[0]))
+    oii3729_error_map = np.sqrt(1 / (dap_gal_fits[31].data[1]))
+    o3_5008_error_map = np.sqrt(1 / (dap_gal_fits[31].data[16]))
+    sii6718_error_map = np.sqrt(1 / (dap_gal_fits[31].data[25]))
+    sii6732_error_map = np.sqrt(1 / (dap_gal_fits[31].data[26]))
 
     # apply bad pixels mask to Maps with a fill val = np.nan
     ha_map_clean = map_masking(
@@ -465,7 +560,7 @@ def write_maps2fits_mpldap(plateifu="None", mode="local", sample="bbrd", z="Fals
     sii6718_mapdc = c00_kcorr(sii6718_map_clean, 0.6718, bdec_map, Rv=4.05)
     sii6732_mapdc = c00_kcorr(sii6732_map_clean, 0.6732, bdec_map, Rv=4.05)
 
-    # Add k-corrected emission line fluxes
+    # Add k-corrected emission line fluxes to FITS file
     new_hdul.append(
         fits.ImageHDU(ha_mapdc, name="Halpha kcorr", ver=2)
     )  # Halpha k-corrected [1e-17 erg / (cm2 s spaxel)]
@@ -502,12 +597,13 @@ def write_maps2fits_mpldap(plateifu="None", mode="local", sample="bbrd", z="Fals
 
     # g-band SNR per pixel map
     # mean g-band weighted SNR per pixel
-    snr_map = dap_gal_fits[5].data
-    new_hdul.append(fits.ImageHDU(snr_map, ver=26, name="g-band SNR"))
+    # snr_map = dap_gal_fits[5].data
+    new_hdul.append(fits.ImageHDU(ha_6564_dqmap, ver=26, name="HALPHA_DQ"))
 
     # My Caluclation for SFRD
-    sfr_map, l_ha, sfrd_map, spaxel_area_kpc = sfr_ha_map(
-        halphadc_map=ha_mapdc / 1e17, z=z
+    bin_area_map = dap_gal_fits[9].data
+    sfr_map, l_ha, sfrd_map, spaxel_area_kpc, spaxel_diamter_in_kpc = sfr_ha_map(
+        halphadc_map=(ha_mapdc / 1e17), z=z, bin_area_map=bin_area_map
     )
 
     # Add Star formation
@@ -578,11 +674,17 @@ def write_maps2fits_mpldap(plateifu="None", mode="local", sample="bbrd", z="Fals
     v_disp = pipe3d_gal_fits[1].data[15]
     v_err = pipe3d_gal_fits[1].data[16]
     ml_ratio = pipe3d_gal_fits[1].data[17]
-    mass_rho = pipe3d_gal_fits[1].data[18]
+    mass_rho = pipe3d_gal_fits[1].data[
+        19
+    ]  # 18 is not dust corrected - 19 is dust corrected
+    mass_rho_err = pipe3d_gal_fits[1].data[20]
+
+    # Indexs are not corrected for velocity dispersion
     d4000_index = pipe3d_gal_fits[3].data[5]
     d4000_err = pipe3d_gal_fits[3].data[13]
     hdelta_index = pipe3d_gal_fits[3].data[0]
     hdelta_err = pipe3d_gal_fits[3].data[8]
+
     # Add Pipe3D maps to FITS
     new_hdul.append(fits.ImageHDU(age_l, ver=36, name="Gyr_lw"))
     new_hdul.append(fits.ImageHDU(age_m, ver=37, name="Gyr_mw"))
@@ -597,31 +699,257 @@ def write_maps2fits_mpldap(plateifu="None", mode="local", sample="bbrd", z="Fals
     new_hdul.append(fits.ImageHDU(ml_ratio, ver=46, name="M/L"))
     new_hdul.append(fits.ImageHDU(mass_rho, ver=47, name="Msun/spx2"))
     new_hdul.append(fits.ImageHDU(mass_rho / 0.25, ver=48, name="Msun/arcs2"))
-    new_hdul.append(fits.ImageHDU(mass_rho / spaxel_area_kpc, ver=49, name="Msun/kpc2"))
+    new_hdul.append(fits.ImageHDU(mass_rho_err, ver=49, name="Msun_ERR"))
     new_hdul.append(fits.ImageHDU(d4000_index, ver=50, name="D4000"))
     new_hdul.append(fits.ImageHDU(d4000_err, ver=51, name="D4000_err"))
     new_hdul.append(fits.ImageHDU(hdelta_index, ver=52, name="Hdelta"))
     new_hdul.append(fits.ImageHDU(hdelta_err, ver=53, name="Hdelta_err"))
 
     # BPT classification mask
-    o3hb_ratio, n2ha_ratio, combo_mask_num = bpt_ifu_classification(
-        o3_5008_mapdc, hb_mapdc, nii6585_mapdc, ha_mapdc
+    # o3hb_ratio, n2ha_ratio, combo_mask_num = bpt_ifu_classification(
+    #     o3_5008_mapdc, hb_mapdc, nii6585_mapdc, ha_mapdc
+    # )
+    o3hb_ratio_map, n2ha_ratio_map, bpt_2d_constant_map = bpt_n2ha_2dmap(
+        o3_5008_map_clean, hb_map_clean, nii6585_map_clean, ha_map_clean
     )
-    new_hdul.append(fits.ImageHDU(o3hb_ratio, ver=54, name="O3HB_RATIO"))
-    new_hdul.append(fits.ImageHDU(n2ha_ratio, ver=55, name="N2HA_RATIO"))
-    new_hdul.append(fits.ImageHDU(combo_mask_num, ver=56, name="BPT CLASS"))
+    new_hdul.append(fits.ImageHDU(o3hb_ratio_map, ver=54, name="O3HB_RATIO"))
+    new_hdul.append(fits.ImageHDU(n2ha_ratio_map, ver=55, name="N2HA_RATIO"))
+    new_hdul.append(fits.ImageHDU(bpt_2d_constant_map, ver=56, name="BPT_CLASS"))
 
     # Bluck et al. 2020 delta SFR = SFRD - Bluck least square minimization
     sfms_fit_map = 0.90 * mass_rho - 9.57  # Bluck least square minimization fit
-    delta_sfr = np.log10(sfrd_map) - sfms_fit_map
-    new_hdul.append(fits.ImageHDU(delta_sfr, ver=57, name="B20 DELTASFR"))
+    sfms_fit_map_upperlimit = 1.21 * mass_rho - 11.5  # upper limit
+    sfms_fit_map_lowerlimit = 0.68 * mass_rho - 7.64  # lower limit
+    delta_sfr = np.log10(sfrd_map) - sfms_fit_map  # Delta SFR
+    new_hdul.append(fits.ImageHDU(delta_sfr, ver=57, name="B20_DELTASFR"))
+    new_hdul.append(fits.ImageHDU(sfms_fit_map, ver=58, name="B20_SFRD"))
+    new_hdul.append(
+        fits.ImageHDU(sfms_fit_map_upperlimit, ver=59, name="B20_SFRD_UPLIM")
+    )
+    new_hdul.append(
+        fits.ImageHDU(sfms_fit_map_lowerlimit, ver=60, name="B20_SFRD_LOWLIM")
+    )
 
+    # D4000 and Dn4000 from DAP Maps (Must be corrected to convert measurements to 0 velocity dispersion at the MILES resolution)
+    # dap_d4000_map = dap_gal_fits["SPECINDEX"].data[43]
+    # dap_dn4000_map = dap_gal_fits["SPECINDEX"].data[44]
+    # dap_hdelta_A_map = dap_gal_fits["SPECINDEX"].data[21]
+    # dap_hdelta_F_map = dap_gal_fits["SPECINDEX"].data[23]
+
+    # Remove bad DQ spaxel_size
+    dap_d4000_map_clean = map_masking(
+        map_arr=dap_gal_fits["SPECINDEX"].data[43],
+        mask_arr=dap_gal_fits["SPECINDEX_MASK"].data[43],
+        fill_val=np.nan,
+        real_val=0,
+    )
+
+    dap_dn4000_map_clean = map_masking(
+        map_arr=dap_gal_fits["SPECINDEX"].data[44],
+        mask_arr=dap_gal_fits["SPECINDEX_MASK"].data[44],
+        fill_val=np.nan,
+        real_val=0,
+    )
+
+    dap_hdelta_A_map_clean = map_masking(
+        map_arr=dap_gal_fits["SPECINDEX"].data[21],
+        mask_arr=dap_gal_fits["SPECINDEX_MASK"].data[21],
+        fill_val=np.nan,
+        real_val=0,
+    )
+
+    dap_hdelta_F_map_clean = map_masking(
+        map_arr=dap_gal_fits["SPECINDEX"].data[23],
+        mask_arr=dap_gal_fits["SPECINDEX_MASK"].data[23],
+        fill_val=np.nan,
+        real_val=0,
+    )
+
+    # Correct index for velocity dispersion
+    dap_d4000_map_clean_corr = np.sqrt(
+        (dap_d4000_map_clean ** 2) - (dap_gal_fits["SPECINDEX_CORR"].data[43] ** 2)
+    )
+    dap_dn4000_map_clean_corr = np.sqrt(
+        (dap_dn4000_map_clean ** 2) - (dap_gal_fits["SPECINDEX_CORR"].data[44] ** 2)
+    )
+    dap_hdelta_A_map_clean_corr = np.sqrt(
+        (dap_hdelta_A_map_clean ** 2) - (dap_gal_fits["SPECINDEX_CORR"].data[21] ** 2)
+    )
+    dap_hdelta_F_map_clean_corr = np.sqrt(
+        (dap_hdelta_F_map_clean ** 2) - (dap_gal_fits["SPECINDEX_CORR"].data[23] ** 2)
+    )
+
+    # Add specindex Maps
+    new_hdul.append(fits.ImageHDU(dap_d4000_map_clean_corr, ver=61, name="DAP_D4000"))
+    new_hdul.append(fits.ImageHDU(dap_dn4000_map_clean_corr, ver=62, name="DAP_Dn4000"))
+    new_hdul.append(
+        fits.ImageHDU(dap_hdelta_A_map_clean_corr, ver=63, name="DAP_hdeltaA")
+    )
+    new_hdul.append(
+        fits.ImageHDU(dap_hdelta_F_map_clean_corr, ver=64, name="DAP_hdeltaF")
+    )
+
+    # inverse varience specindex maps converted to error values
+    dap_d4000_err_clean = map_masking(
+        map_arr=dap_gal_fits["SPECINDEX_IVAR"].data[43],
+        mask_arr=dap_gal_fits["SPECINDEX_MASK"].data[43],
+        fill_val=np.nan,
+        real_val=0,
+    )
+    dap_dn4000_err_clean = map_masking(
+        map_arr=dap_gal_fits["SPECINDEX_IVAR"].data[44],
+        mask_arr=dap_gal_fits["SPECINDEX_MASK"].data[44],
+        fill_val=np.nan,
+        real_val=0,
+    )
+
+    dap_hdelta_A_err_clean = map_masking(
+        map_arr=dap_gal_fits["SPECINDEX_IVAR"].data[21],
+        mask_arr=dap_gal_fits["SPECINDEX_MASK"].data[21],
+        fill_val=np.nan,
+        real_val=0,
+    )
+
+    dap_hdelta_F_err_clean = map_masking(
+        map_arr=dap_gal_fits["SPECINDEX_IVAR"].data[23],
+        mask_arr=dap_gal_fits["SPECINDEX_MASK"].data[23],
+        fill_val=np.nan,
+        real_val=0,
+    )
+
+    # Add Clean error arrays to the fits file
+    new_hdul.append(fits.ImageHDU(dap_d4000_err_clean, ver=65, name="DAP_D4000_IVAR"))
+    new_hdul.append(fits.ImageHDU(dap_dn4000_err_clean, ver=66, name="DAP_Dn4000_IVAR"))
+    new_hdul.append(
+        fits.ImageHDU(dap_hdelta_A_err_clean, ver=67, name="DAP_hdeltaA_IVAR")
+    )
+    new_hdul.append(
+        fits.ImageHDU(dap_hdelta_F_err_clean, ver=68, name="DAP_hdeltaF_IVAR")
+    )
+
+    # # DQ mask specindex maps
+    # new_hdul.append(
+    #     fits.ImageHDU(dap_gal_fits[51].data[43], ver=69, name="DAP_D4000_DQMASK")
+    # )
+    # new_hdul.append(
+    #     fits.ImageHDU(dap_gal_fits[51].data[44], ver=70, name="DAP_Dn4000_DQMASK")
+    # )
+    # new_hdul.append(
+    #     fits.ImageHDU(dap_gal_fits[51].data[21], ver=71, name="DAP_hdeltaA_DQMASK")
+    # )
+    # new_hdul.append(
+    #     fits.ImageHDU(dap_gal_fits[51].data[23], ver=72, name="DAP_hdeltaF_DQMASK")
+    # )
+
+    # # Specindex correction maps (if units are ang DAP_index * DAP_index_CORR)
+    # new_hdul.append(
+    #     fits.ImageHDU(dap_gal_fits[52].data[43], ver=73, name="DAP_D4000_CORR")
+    # )
+    # new_hdul.append(
+    #     fits.ImageHDU(dap_gal_fits[52].data[44], ver=74, name="DAP_Dn4000_CORR")
+    # )
+    # new_hdul.append(
+    #     fits.ImageHDU(dap_gal_fits[52].data[21], ver=75, name="DAP_hdeltaA_CORR")
+    # )
+    # new_hdul.append(
+    #     fits.ImageHDU(dap_gal_fits[52].data[23], ver=76, name="DAP_hdeltaF_CORR")
+    # )
+
+    # Radius in kpc
+    new_hdul.append(fits.ImageHDU(r_map * spaxel_diamter_in_kpc, ver=69, name="R_KPC"))
+
+    ######## Gas velocity dispersion measurments from the MaNGA DAP files
+    # - None corrected gas velocity dispersion - Remove masked pixels from array
+    ha_sigma_gas_map_clean = map_masking(
+        map_arr=dap_gal_fits["EMLINE_GSIGMA"].data[23],
+        mask_arr=dap_gal_fits["EMLINE_GSIGMA_MASK"].data[23],
+        fill_val=np.nan,
+        real_val=0,
+    )
+
+    # - Corrected velocity dispersion for instrunmental resolution effects
+    ha_sigma_gas_corr = np.sqrt(
+        (ha_sigma_gas_map_clean ** 2) - (dap_gal_fits["EMLINE_INSTSIGMA"].data[23] ** 2)
+    )
+
+    ha_sigma_gas_map_error = map_masking(
+        map_arr=dap_gal_fits["EMLINE_GSIGMA_IVAR"].data[23],
+        mask_arr=dap_gal_fits["EMLINE_GSIGMA_MASK"].data[23],
+        fill_val=np.nan,
+        real_val=0,
+    )
+    # - Add to mm_fits file
+    new_hdul.append(
+        fits.ImageHDU(ha_sigma_gas_corr, ver=70, name="GASVEL_DISP")
+    )  # [km/s]
+    new_hdul.append(
+        fits.ImageHDU(ha_sigma_gas_map_error, ver=71, name="GASVEL_ERR_DISP")
+    )  # [km/s]
+
+    ######## Stellar velocity dispersion measurments from the MaNGA DAP files
+    # Non-corrected velcoity dispersion
+    ha_sigma_star_map_clean = map_masking(
+        map_arr=dap_gal_fits["STELLAR_SIGMA"].data,
+        mask_arr=dap_gal_fits["STELLAR_SIGMA_MASK"].data,
+        fill_val=np.nan,
+        real_val=0,
+    )
+    # Error
+    ha_sigma_star_map_error = map_masking(
+        map_arr=dap_gal_fits["STELLAR_SIGMA_IVAR"].data,
+        mask_arr=dap_gal_fits["STELLAR_SIGMA_MASK"].data,
+        fill_val=np.nan,
+        real_val=0,
+    )
+    # - Corrected velocity dispersion for instrunmental
+    ha_sigma_star_corr1 = np.sqrt(
+        (ha_sigma_star_map_clean ** 2) - (dap_gal_fits["STELLAR_SIGMACORR"].data[0] ** 2)
+    )
+    ha_sigma_star_corr2 = np.sqrt(
+        (ha_sigma_star_map_clean ** 2) - (dap_gal_fits["STELLAR_SIGMACORR"].data[1] ** 2)
+    )
+
+    # - Add to new mm_fits file
+    new_hdul.append(fits.ImageHDU(ha_sigma_star_corr1, ver=72, name="STARVEL_DISP1"))
+    new_hdul.append(fits.ImageHDU(ha_sigma_star_corr2, ver=73, name="STARVEL_DISP2"))
+
+    new_hdul.append(
+        fits.ImageHDU(ha_sigma_star_map_error, ver=74, name="STARVEL_DISPERR")
+    )
+
+    # Morphology data from galaxy Zoo
     # Update header
     prihdr = new_hdul[0].header
     prihdr["SPX_AREA"] = "{} Kpc^2".format(str(spaxel_area_kpc)[:5])
+    prihdr["kpc/arcsec"] = "{}".format(np.round(spaxel_diamter_in_kpc, 4))
+    # prihdr["kpc/arcsec"] = "{}".format(str(spaxel_diamter_in_kpc)[:5])
     prihdr["REFF"] = "{} ARCSECS".format(str(r_eff)[:5])
     prihdr["z"] = "{} redshift".format(str(z)[:5])
     prihdr["plateifu"] = plateifu
+
+    # Visual classification on T-Type morphology for BBRD galaxies
+    if (
+        plateifu == "10001-3702"
+        or plateifu == "11758-1901"
+        or plateifu == "11827-1902"
+        or plateifu == "8254-1902"
+        or plateifu == "8565-1902"
+    ):
+        prihdr["TTYPE_MM"] = "S0"
+
+    elif plateifu == "10217-6103" or plateifu == "8312-12704":
+        prihdr["TTYPE_MM"] = "SBa"
+
+    elif plateifu == "12094-1901" or plateifu == "8550-12703":
+        prihdr["TTYPE_MM"] = "SBb"
+
+    elif plateifu == "9894-3703" or plateifu == "8465-1902":
+        prihdr["TTYPE_MM"] = "Sa"
+
+    elif plateifu == "8595-3703":
+        prihdr["TTYPE_MM"] = "Merger"
+
+    # Store integrated measurments from Pipe3D SDSS17Pipe3D_v3_1_1.csv
 
     # Write data to FITS file
     new_hdul.writeto(
@@ -641,7 +969,7 @@ def read_fits_ext(fits_file, ext=1):
 
 
 ############## Execution of function
-# %%time
+
 # Read bbrd final crossmatch table
 bbrd_df = pd.read_csv(
     "/Users/mmckay/Desktop/research/FMR_MZR/final_MaNGAdr16_bbrd_crossmatch.csv"
@@ -656,6 +984,7 @@ for plateifu, nsa_z in zip(bbrd_df["plateifu"], bbrd_df["nsa_z"]):
     write_maps2fits_mpldap(plateifu, mode="local", sample="bbrd", z=nsa_z)
 
 
+############## Storing the 2D maps in ID series of Datafame ##############
 # Flatten 2D map to a 1D column and stores the in a CSV file
 # Store 2D Maps as 1D columns in a pandas dataframe
 # List of BBRD FITS files made by generate code MM
@@ -664,7 +993,7 @@ bbrd_fits_filelist = glob.glob(
 )
 
 # The range of FITS extension np.arange(1,1+last ver #,1)
-extnum_list = np.arange(1, 58, 1)
+extnum_list = np.arange(1, 75, 1)
 
 
 for fit in bbrd_fits_filelist:
@@ -688,47 +1017,118 @@ for fit in bbrd_fits_filelist:
     )
     hdu.close()
 
-
-# Same as above but for LG12 - should reformat later (5/2/21)
-# Run code for all galaxies in a sample
-# Read bbrd final crossmatch table
-lg12_df = pd.read_csv(
-    "/Users/mmckay/Desktop/research/FMR_MZR/final_MaNGAdr16_lg12_crossmatch.csv"
+# Combine all dataframes into a super dataframe
+bbrd_csv_list = glob.glob(
+    "/Users/mmckay/Desktop/research/FMR_MZR/bbrd_MMfits/*_map.csv"
 )
-for plateifu, nsa_z in zip(lg12_df["plateifu"], lg12_df["nsa_z"]):
-    # print(plateifu, nsa_z)
-    write_maps2fits_mpldap(plateifu, mode="local", sample="lg12", z=nsa_z)
+combo_csv_list = []
+agn_combo_csv_list = []
+xl_combo_csv_list = []
+for bbrd in bbrd_csv_list:
+    
+
+    # Remove the merger and AGN galaxy from the Combo csv file and adds AGn to there own csv 
+    if (
+        bbrd == "/Users/mmckay/Desktop/research/FMR_MZR/bbrd_MMfits/9183-3703_map.csv"
+        or bbrd
+        == "/Users/mmckay/Desktop/research/FMR_MZR/bbrd_MMfits/11827-1902_map.csv"
+    ):
+        print('appending AGN')
+        bbrd_df = pd.read_csv(bbrd)
+        print(bbrd, bbrd_df.shape)
+        agn_combo_csv_list.append(bbrd_df)
+
+    elif (bbrd == "/Users/mmckay/Desktop/research/FMR_MZR/bbrd_MMfits/8595-3703_map.csv"):
+        pass
+
+    # # Remove large galaxies from the combo_bbrd and and adds to there own CSV files
+    # elif (bbrd == "/Users/mmckay/Desktop/research/FMR_MZR/bbrd_MMfits/8312-12704_map.csv"
+    # or bbrd == "/Users/mmckay/Desktop/research/FMR_MZR/bbrd_MMfits/8465-9102_map.csv"
+    # or bbrd == "/Users/mmckay/Desktop/research/FMR_MZR/bbrd_MMfits/8550-12703_map.csv"
+    # ):
+    #     print('Appending XL galaxies CSV')
+    #     bbrd_df = pd.read_csv(bbrd)
+    #     print(bbrd, bbrd_df.shape)
+    #     xl_combo_csv_list.append(bbrd_df)
 
 
-# Flatten 2D map to a 1D column and stores the in a CSV file
-# Store 2D Maps as 1D columns in a pandas dataframe
-# List of lg12 FITS files made by generate code MM
-lg12_fits_filelist = glob.glob(
-    "/Users/mmckay/Desktop/research/FMR_MZR/lg12_MMfits/*.fits"
+    else:
+        bbrd_df = pd.read_csv(bbrd)
+        print(bbrd, bbrd_df.shape)
+        combo_csv_list.append(bbrd_df)
+
+# Combine csv files
+bbrd_supercsv = pd.concat(combo_csv_list)
+# Replace inf value with nans
+bbrd_supercsv_clean = bbrd_supercsv.replace([np.inf, -np.inf], np.nan)
+bbrd_supercsv_clean.to_csv(
+    path_or_buf="/Users/mmckay/Desktop/research/FMR_MZR/bbrd_MMfits/bbrd_combo.csv",
+    sep=",",
 )
 
-# The range of FITS extension np.arange(1,1+last ver #,1)
-extnum_list = np.arange(1, 58, 1)
+# Combine AGN csv files
+bbrd_agn_supercsv = pd.concat(agn_combo_csv_list)
+# Replace inf value with nans
+bbrd_agn_supercsv_clean = bbrd_agn_supercsv.replace([np.inf, -np.inf], np.nan)
+bbrd_agn_supercsv_clean.to_csv(
+    path_or_buf="/Users/mmckay/Desktop/research/FMR_MZR/bbrd_MMfits/bbrd_agn_combo.csv",
+    sep=",",
+)
+
+# # Combine AGN csv files
+# bbrd_xl_supercsv = pd.concat(xl_combo_csv_list)
+# # Replace inf value with nans
+# bbrd_xl_supercsv_clean = bbrd_xl_supercsv.replace([np.inf, -np.inf], np.nan)
+# bbrd_xl_supercsv_clean.to_csv(
+#     path_or_buf="/Users/mmckay/Desktop/research/FMR_MZR/bbrd_MMfits/bbrd_xl_combo.csv",
+#     sep=",",
+# )
+# %%
+
+## Same as above but for LG12 - should reformat later (5/2/21)
+## Run code for all galaxies in a sample
+## Read lg12 final crossmatch table
 
 
-for fit in lg12_fits_filelist:
-    hdu = fits.open(fit)
-    ifu_df = pd.DataFrame()
-    for extnum in extnum_list:
-        # Read in 2d data from fits file extension
-        map2d_data = read_fits_ext(fit, ext=hdu[extnum - 1].name)
-        # Flatten 2d map
-        map1d_data = map2d_data.flatten(order="C")
-        # print(extnum, hdu[extnum-1].ver, hdu[extnum-1].name, map1d_data.shape)
-        # Pair extname column with the 1D Map data
-        ifu_df[hdu[extnum - 1].name] = map1d_data
+# lg12_df = pd.read_csv(
+#     "/Users/mmckay/Desktop/research/FMR_MZR/final_MaNGAdr16_lg12_crossmatch.csv"
+# )
+# for plateifu, nsa_z in zip(lg12_df["plateifu"], lg12_df["nsa_z"]):
+#     # print(plateifu, nsa_z)
+#     write_maps2fits_mpldap(plateifu, mode="local", sample="lg12", z=nsa_z)
 
-    # print(ifu_df.shape)
-    ifu_df.to_csv(
-        path_or_buf="/Users/mmckay/Desktop/research/FMR_MZR/lg12_MMfits/{}_map.csv".format(
-            hdu[0].header["plateifu"]
-        ),
-        sep=",",
-    )
-    hdu.close()
+
+# # Flatten 2D map to a 1D column and stores the in a CSV file
+# # Store 2D Maps as 1D columns in a pandas dataframe
+# # List of lg12 FITS files made by generate code MM
+# lg12_fits_filelist = glob.glob(
+#     "/Users/mmckay/Desktop/research/FMR_MZR/lg12_MMfits/*.fits"
+# )
+
+# # The range of FITS extension np.arange(1,1+last ver #,1)
+# extnum_list = np.arange(1, 61, 1)
+
+
+# for fit in lg12_fits_filelist:
+#     hdu = fits.open(fit)
+#     ifu_df = pd.DataFrame()
+#     for extnum in extnum_list:
+#         # Read in 2d data from fits file extension
+#         map2d_data = read_fits_ext(fit, ext=hdu[extnum - 1].name)
+#         # Flatten 2d map
+#         map1d_data = map2d_data.flatten(order="C")
+#         # print(extnum, hdu[extnum-1].ver, hdu[extnum-1].name, map1d_data.shape)
+#         # Pair extname column with the 1D Map data
+#         ifu_df[hdu[extnum - 1].name] = map1d_data
+
+#     # print(ifu_df.shape)
+#     ifu_df.to_csv(
+#         path_or_buf="/Users/mmckay/Desktop/research/FMR_MZR/lg12_MMfits/{}_map.csv".format(
+#             hdu[0].header["plateifu"]
+#         ),
+#         sep=",",
+#     )
+#     hdu.close()
+
+
 # %%
